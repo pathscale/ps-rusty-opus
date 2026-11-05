@@ -23,9 +23,11 @@ implementation, at `libopus` quality and up to 1.6× its single-thread encode sp
   application, frame size and bandwidth (3,240-configuration matrix).
 - **Fast.** Runtime-dispatched AVX2/FMA, AVX and SSE2 kernels on x86, NEON on aarch64, each
   with a bit-checked scalar fallback. Frame-parallel encoding is available on top.
-- **Safe by construction.** Packet parsing, the range decoder and every other stage that
-  touches untrusted bytes are entirely safe Rust. `unsafe` is confined to documented SIMD
-  kernels, and every kernel's contract is enforced at its safe entry point.
+- **Packet parsing is written in safe Rust.** Architecture-specific SIMD code uses documented
+  `unsafe` blocks listed in [UNSAFE.md](UNSAFE.md). The crate also exposes low-level SILK
+  encoder functions; the public `silk::nsq::silk_nsq` entry point still relies on caller
+  parameter and slice invariants that are not fully checked. See [TODO.md](docs/TODO.md)
+  before calling that low-level API directly.
 - **Allocation-free streaming.** After warm-up, `OpusDecoder::decode` performs zero heap
   allocations — including packet-loss concealment, multi-frame packets and mode
   transitions — and `OpusEncoder::encode` allocates only on a switch from SILK to CELT

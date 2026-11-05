@@ -295,17 +295,30 @@ fn silk_noise_shape_quantizer_short_prediction(
     a_q12: &[i16],
     predict_lpc_order: i32,
 ) -> i32 {
+    assert!(
+        matches!(predict_lpc_order, 10 | 16),
+        "unsupported prediction order"
+    );
+    let order = predict_lpc_order as usize;
+    assert!(a_q12.len() >= order, "prediction coefficient slice too short");
+    assert!(
+        idx < ps_lpc_q14.len() && idx >= order - 1,
+        "prediction state window too short"
+    );
     // The SIMD kernels read `ps_lpc_q14[idx + 1 - order..=idx]` and `a_q12[..16]`
     // through raw pointers; take them only when that whole window is in bounds
     // (the bit-identical scalar twin below handles anything else).
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     let simd_ok =
-        idx + 1 >= predict_lpc_order as usize && idx < ps_lpc_q14.len() && a_q12.len() >= 16;
+        idx >= order - 1
+            && idx < ps_lpc_q14.len()
+            && a_q12.len() >= order
+            && a_q12.len() >= 16;
     #[cfg(target_arch = "aarch64")]
     if simd_ok && crate::isa::neon() {
         // SAFETY: NEON confirmed by `isa::neon()`; `simd_ok` checked the kernel's
-        // full read window (`idx + 1 >= order`, `idx < ps_lpc_q14.len()`,
-        // `a_q12.len() >= 16`).
+        // full read window (`idx >= order - 1`, `idx < ps_lpc_q14.len()`,
+        // and both the order-sized and 16-element coefficient windows).
         return unsafe { silk_lpc_prediction_neon(ps_lpc_q14, idx, a_q12, predict_lpc_order) };
     }
     #[cfg(target_arch = "x86_64")]
@@ -315,8 +328,8 @@ fn silk_noise_shape_quantizer_short_prediction(
         if simd_ok && lpc_avx2_enabled() {
             // SAFETY: `lpc_avx2_enabled()` is `crate::isa::avx2()`, matching the
             // kernel's `avx2` target feature; `simd_ok` checked its full read
-            // window (`idx + 1 >= order`, `idx < ps_lpc_q14.len()`,
-            // `a_q12.len() >= 16`).
+            // window (`idx >= order - 1`, `idx < ps_lpc_q14.len()`, and both
+            // the order-sized and 16-element coefficient windows).
             return unsafe { silk_lpc_prediction_avx2(ps_lpc_q14, idx, a_q12, predict_lpc_order) };
         }
     }
