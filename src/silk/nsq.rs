@@ -43,6 +43,7 @@ pub fn silk_nsq(
     );
 
     let lsf_interpolation_flag: i32 = i32::from(ps_indices.nlsf_interp_coef_q2 != 4);
+    let voiced = ps_indices.signal_type == TYPE_VOICED as i8;
     let pred_order = ps_enc_c.predict_lpc_order as usize;
     let shape_order = ps_enc_c.shaping_lpc_order as usize;
     for k in 0..ps_enc_c.nb_subfr as usize {
@@ -57,12 +58,123 @@ pub fn silk_nsq(
             "silk_nsq: ar_q13 window is too short"
         );
     }
+    let nb_subfr = ps_enc_c.nb_subfr as usize;
+    let subfr_length = ps_enc_c.subfr_length as usize;
+    let frame_samples = nb_subfr
+        .checked_mul(subfr_length)
+        .expect("silk_nsq: frame length overflow");
+    assert!(
+        ps_enc_c.frame_length >= 0
+            && ps_enc_c.frame_length as usize == frame_samples
+            && frame_samples <= MAX_FRAME_LENGTH,
+        "silk_nsq: frame_length must match the configured subframes"
+    );
+    assert!(
+        x16.len() >= frame_samples,
+        "silk_nsq: input sample slice is too short"
+    );
+    assert!(
+        pulses.len() >= frame_samples,
+        "silk_nsq: pulse slice is too short"
+    );
+    assert!(
+        pitch_l.len() >= nb_subfr,
+        "silk_nsq: pitch slice is too short"
+    );
+    assert!(
+        gains_q16.len() >= nb_subfr,
+        "silk_nsq: gain slice is too short"
+    );
+    assert!(
+        harm_shape_gain_q14.len() >= nb_subfr,
+        "silk_nsq: harmonic-shape gain slice is too short"
+    );
+    assert!(
+        tilt_q14.len() >= nb_subfr,
+        "silk_nsq: tilt slice is too short"
+    );
+    assert!(
+        lf_shp_q14.len() >= nb_subfr,
+        "silk_nsq: low-frequency shaping slice is too short"
+    );
+    assert!(
+        (ps_indices.signal_type >> 1) >= 0
+            && (ps_indices.signal_type >> 1) < 2
+            && (0..2).contains(&ps_indices.quant_offset_type),
+        "silk_nsq: quantizer offset index is out of range"
+    );
+    assert!(
+        ps_enc_c.ltp_mem_length >= 0
+            && (ps_enc_c.ltp_mem_length as usize) <= LTP_MEM_LENGTH_MS * MAX_FS_KHZ,
+        "silk_nsq: LTP memory length is out of range"
+    );
+    let ltp_mem_length = ps_enc_c.ltp_mem_length as usize;
+    assert!(
+        frame_samples == 0 || ltp_mem_length > 0,
+        "silk_nsq: nonempty frames require positive LTP memory"
+    );
+    let nsq_state_length = frame_samples
+        .checked_add(ltp_mem_length)
+        .expect("silk_nsq: NSQ state length overflow");
+    assert!(
+        nsq_state_length <= nsq.xq.len() && nsq_state_length <= nsq.s_ltp_shp_q14.len(),
+        "silk_nsq: frame and LTP memory exceed NSQ state capacity"
+    );
+    if voiced {
+        assert!(
+            ltp_coef_q14.len()
+                >= nb_subfr
+                    .checked_mul(LTP_ORDER)
+                    .expect("silk_nsq: LTP coefficient length overflow"),
+            "silk_nsq: LTP coefficient slice is too short"
+        );
+        assert!(
+            pred_order >= 6 && pred_order % 2 == 0,
+            "silk_nsq: voiced predict_lpc_order must be even and in 6..=MAX_LPC_ORDER"
+        );
+
+        // Validate all voiced history windows before mutating NSQ state or pulses.
+        let mut pred_idx = ltp_mem_length;
+        let mut shp_idx = ltp_mem_length;
+        for k in 0..nb_subfr {
+            let lag = pitch_l[k];
+            assert!(
+                lag > (LTP_ORDER / 2) as i32,
+                "silk_nsq: voiced pitch lag must exceed half the LTP order"
+            );
+            let lag = lag as usize;
+            let rewhite = (k & (3 - (lsf_interpolation_flag << 1) as usize)) == 0;
+            if rewhite {
+                let start_idx =
+                    ltp_mem_length as i64 - lag as i64 - pred_order as i64 - (LTP_ORDER as i64 / 2);
+                assert!(
+                    start_idx > 0,
+                    "silk_nsq: voiced pitch lag is out of range for rewhitening"
+                );
+                pred_idx = ltp_mem_length;
+            } else {
+                assert!(
+                    pred_idx >= lag + LTP_ORDER / 2,
+                    "silk_nsq: voiced pitch lag exceeds LTP predictor history"
+                );
+            }
+            assert!(
+                shp_idx >= lag + HARM_SHAPE_FIR_TAPS / 2,
+                "silk_nsq: voiced pitch lag exceeds shaping history"
+            );
+            pred_idx = pred_idx
+                .checked_add(subfr_length)
+                .expect("silk_nsq: LTP index overflow");
+            shp_idx = shp_idx
+                .checked_add(subfr_length)
+                .expect("silk_nsq: shaping index overflow");
+        }
+    }
 
     let _prof = crate::prof::scope(crate::prof::Stage::SilkNsq);
     let mut lag: usize;
     let mut start_idx: usize;
     let mut a_q12: &[i16];
-    let mut b_q14: &[i16];
     let mut ar_shp_q13: &[i16];
     let mut harm_shape_fir_packed_q14: i32;
     let mut offset_q10: i32;
@@ -84,12 +196,17 @@ pub fn silk_nsq(
     for k in 0..ps_enc_c.nb_subfr as usize {
         let a_offset = ((k >> 1) | (1 - lsf_interpolation_flag as usize)) * MAX_LPC_ORDER;
         a_q12 = &pred_coef_q12[a_offset..a_offset + pred_order];
-        b_q14 = &ltp_coef_q14[k * LTP_ORDER..];
+        let b_q14 = if voiced {
+            let offset = k * LTP_ORDER;
+            &ltp_coef_q14[offset..offset + LTP_ORDER]
+        } else {
+            &[]
+        };
         let shape_offset = k * MAX_SHAPE_LPC_ORDER;
         ar_shp_q13 = &ar_q13[shape_offset..shape_offset + shape_order];
 
         nsq.rewhite_flag = 0;
-        if ps_indices.signal_type == TYPE_VOICED as i8 {
+        if voiced {
             lag = pitch_l[k] as usize;
 
             if (k & (3 - (lsf_interpolation_flag << 1) as usize)) == 0 {
@@ -97,7 +214,10 @@ pub fn silk_nsq(
                     - lag as i32
                     - ps_enc_c.predict_lpc_order
                     - (LTP_ORDER as i32 / 2);
-                debug_assert!(start_idx_signed > 0);
+                assert!(
+                    start_idx_signed > 0,
+                    "silk_nsq: rewhitening start must be positive"
+                );
                 start_idx = start_idx_signed as usize;
 
                 silk_lpc_analysis_filter(
@@ -360,10 +480,10 @@ fn silk_noise_shape_quantizer(
 ) {
     let gain_q10 = gain_q16 >> 6;
 
-    let shp_lag_base = (nsq.s_ltp_shp_buf_idx as usize).wrapping_sub(lag) + HARM_SHAPE_FIR_TAPS / 2;
-    let pred_lag_base = (nsq.s_ltp_buf_idx as usize).wrapping_sub(lag) + LTP_ORDER / 2;
-
     if signal_type == TYPE_VOICED {
+        let shp_lag_base =
+            (nsq.s_ltp_shp_buf_idx as usize).wrapping_sub(lag) + HARM_SHAPE_FIR_TAPS / 2;
+        let pred_lag_base = (nsq.s_ltp_buf_idx as usize).wrapping_sub(lag) + LTP_ORDER / 2;
         silk_noise_shape_quantizer_voiced(
             nsq,
             x_sc_q10,
@@ -980,7 +1100,10 @@ fn silk_noise_shape_quantizer_unvoiced(
 #[cfg(test)]
 mod tests {
     use super::silk_nsq;
-    use crate::silk::define::{MAX_LPC_ORDER, MAX_NB_SUBFR, MAX_SHAPE_LPC_ORDER, MAX_SUB_FRAME_LENGTH};
+    use crate::silk::define::{
+        LTP_ORDER, MAX_LPC_ORDER, MAX_NB_SUBFR, MAX_SHAPE_LPC_ORDER, MAX_SUB_FRAME_LENGTH,
+        TYPE_VOICED,
+    };
     use crate::silk::structs::{SideInfoIndices, SilkEncoderStateCommon, SilkNSQState};
 
     fn valid_common() -> SilkEncoderStateCommon {
@@ -1011,6 +1134,201 @@ mod tests {
             &[],
             0,
             0,
+        );
+    }
+
+    fn call_configured(
+        common: &SilkEncoderStateCommon,
+        indices: &SideInfoIndices,
+        ltp_coef_q14: &[i16],
+        pitch: &[i32],
+        pulses: &mut [i8],
+        nsq: &mut SilkNSQState,
+    ) {
+        let frame_len = (common.nb_subfr * common.subfr_length) as usize;
+        silk_nsq(
+            common,
+            nsq,
+            indices,
+            &vec![0; frame_len],
+            pulses,
+            &vec![0; 2 * MAX_LPC_ORDER],
+            ltp_coef_q14,
+            &vec![0; common.nb_subfr as usize * MAX_SHAPE_LPC_ORDER],
+            &vec![0; common.nb_subfr as usize],
+            &vec![0; common.nb_subfr as usize],
+            &vec![0; common.nb_subfr as usize],
+            &vec![65536; common.nb_subfr as usize],
+            pitch,
+            0,
+            0,
+        );
+    }
+
+    fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+        payload
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_owned())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .expect("panic payload must be a string")
+    }
+
+    fn voiced_two_subframes() -> (SilkEncoderStateCommon, SideInfoIndices) {
+        let mut common = valid_common();
+        common.nb_subfr = 2;
+        common.subfr_length = 20;
+        common.frame_length = 40;
+        common.ltp_mem_length = 32;
+        let mut indices = SideInfoIndices::default();
+        indices.signal_type = TYPE_VOICED as i8;
+        indices.nlsf_interp_coef_q2 = 4;
+        (common, indices)
+    }
+
+    #[test]
+    fn rejects_short_pulses_before_mutating_state() {
+        let mut common = valid_common();
+        common.frame_length = 1;
+        common.ltp_mem_length = 1;
+        let mut nsq = SilkNSQState::default();
+        nsq.rand_seed = 123;
+        let mut pulses = [];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            call_configured(
+                &common,
+                &SideInfoIndices::default(),
+                &[],
+                &[0],
+                &mut pulses,
+                &mut nsq,
+            );
+        }));
+        let error = result.expect_err("short pulse slice must be rejected");
+        assert!(panic_message(error).contains("pulse slice is too short"));
+        assert_eq!(nsq.rand_seed, 123);
+        assert!(pulses.is_empty());
+    }
+
+    #[test]
+    fn rejects_zero_history_before_mutating_nonvoiced_frame() {
+        let mut common = valid_common();
+        common.frame_length = 1;
+        let mut nsq = SilkNSQState::default();
+        nsq.rand_seed = 123;
+        let mut pulses = [7];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            call_configured(
+                &common,
+                &SideInfoIndices::default(),
+                &[],
+                &[0],
+                &mut pulses,
+                &mut nsq,
+            );
+        }));
+        let error = result.expect_err("zero history must be rejected");
+        assert!(panic_message(error).contains("nonempty frames require positive LTP memory"));
+        assert_eq!(nsq.rand_seed, 123);
+        assert_eq!(pulses, [7]);
+    }
+
+    #[test]
+    fn rejects_later_bad_voiced_lag_before_mutating_frame() {
+        let (common, indices) = voiced_two_subframes();
+        let mut nsq = SilkNSQState::default();
+        nsq.rand_seed = 123;
+        let mut pulses = [7; 40];
+        let before = nsq;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            call_configured(
+                &common,
+                &indices,
+                &[0; 2 * LTP_ORDER],
+                &[16, 51],
+                &mut pulses,
+                &mut nsq,
+            );
+        }));
+        let error = result.expect_err("later voiced lag must be rejected");
+        assert!(panic_message(error).contains("voiced pitch lag exceeds LTP predictor history"));
+        assert_eq!(nsq.rand_seed, before.rand_seed);
+        assert_eq!(nsq.s_ltp_buf_idx, before.s_ltp_buf_idx);
+        assert_eq!(nsq.xq, before.xq);
+        assert_eq!(nsq.s_ltp_shp_q14, before.s_ltp_shp_q14);
+        assert_eq!(pulses, [7; 40]);
+    }
+
+    #[test]
+    fn accepts_valid_nonrewhitened_lag_and_nonvoiced_order_five() {
+        let (common, indices) = voiced_two_subframes();
+        let mut nsq = SilkNSQState::default();
+        let mut pulses = [0; 40];
+        call_configured(
+            &common,
+            &indices,
+            &[0; 2 * LTP_ORDER],
+            &[16, 20],
+            &mut pulses,
+            &mut nsq,
+        );
+
+        let mut short_nsq = SilkNSQState::default();
+        short_nsq.rand_seed = 123;
+        let before = short_nsq;
+        let mut short_pulses = [7; 40];
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            call_configured(
+                &common,
+                &indices,
+                &[0; 2 * LTP_ORDER - 1],
+                &[16, 20],
+                &mut short_pulses,
+                &mut short_nsq,
+            );
+        }));
+        let error = result.expect_err("short voiced LTP coefficients must be rejected");
+        assert!(panic_message(error).contains("LTP coefficient slice is too short"));
+        assert_eq!(short_nsq.rand_seed, before.rand_seed);
+        assert_eq!(short_nsq.xq, before.xq);
+        assert_eq!(short_nsq.s_ltp_shp_q14, before.s_ltp_shp_q14);
+        assert_eq!(short_pulses, [7; 40]);
+
+        let mut common = valid_common();
+        common.predict_lpc_order = 5;
+        common.frame_length = 1;
+        common.ltp_mem_length = 32;
+        let mut nsq = SilkNSQState::default();
+        nsq.lag_prev = 33;
+        let mut pulses = [0];
+        call_configured(
+            &common,
+            &SideInfoIndices::default(),
+            &[],
+            &[0],
+            &mut pulses,
+            &mut nsq,
+        );
+        assert_eq!(nsq.s_ltp_buf_idx, 33);
+        assert_eq!(nsq.s_ltp_shp_buf_idx, 33);
+    }
+
+    #[test]
+    #[should_panic(expected = "pitch lag must exceed half")]
+    fn rejects_voiced_lag_one() {
+        let mut common = valid_common();
+        common.frame_length = 1;
+        common.ltp_mem_length = 32;
+        let mut indices = SideInfoIndices::default();
+        indices.signal_type = TYPE_VOICED as i8;
+        let mut nsq = SilkNSQState::default();
+        let mut pulses = [0];
+        call_configured(
+            &common,
+            &indices,
+            &[0; LTP_ORDER],
+            &[1],
+            &mut pulses,
+            &mut nsq,
         );
     }
 
