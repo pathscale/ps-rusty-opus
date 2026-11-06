@@ -25,9 +25,9 @@ implementation, at `libopus` quality and up to 1.6× its single-thread encode sp
   with a bit-checked scalar fallback. Frame-parallel encoding is available on top.
 - **Packet parsing is written in safe Rust.** Architecture-specific SIMD code uses documented
   `unsafe` blocks listed in [UNSAFE.md](UNSAFE.md). The crate also exposes low-level SILK
-  encoder functions; the public `silk::nsq::silk_nsq` entry point still relies on caller
-  parameter and slice invariants that are not fully checked. See [TODO.md](docs/TODO.md)
-  before calling that low-level API directly.
+  encoder functions. The public `silk::nsq::silk_nsq` boundary now validates unchecked-loop
+  parameters and coefficient windows. Eight rejection regressions pass; valid-input
+  codec compatibility checks remain pending. See [TODO.md](docs/TODO.md).
 - **Allocation-free streaming.** After warm-up, `OpusDecoder::decode` performs zero heap
   allocations — including packet-loss concealment, multi-frame packets and mode
   transitions — and `OpusEncoder::encode` allocates only on a switch from SILK to CELT

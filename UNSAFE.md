@@ -194,12 +194,12 @@ Columns: location, kind, enclosing function, and the first line of the justifica
 
 | Line | Kind | Function | Justification (first line) |
 |---:|---|---|---|
-| 227 | unsafe block | `silk_nsq_noise_shape_feedback_loop` | every index touched is in `0..order`. |
-| 264 | unsafe block | `silk_nsq_noise_shape_feedback_loop_order12` | indices 0..=11 only. |
-| 394 | unsafe block | `lpc_pred_order6` | reads `s_lpc[idx - 5..=idx]` and `a_q12[0..6]`. |
-| 439 | unsafe block | `lpc_pred_order10` | reads `s_lpc[idx - 9..=idx]` and `a_q12[0..10]`. |
-| 504 | unsafe block | `lpc_pred_order16` | reads `s_lpc[idx - 15..=idx]` and `a_q12[0..16]`. |
-| 599 | unsafe block | `lpc_pred_generic` | requires `order <= 16`: then `idx - j >= idx - 15 >= 0` (`idx = NSQ_LPC_BUF_LENGTH - 1 + i`), `idx < s_lpc.len()` (see `lpc_pred_order16`), and `j < 1 |
+| 258 | unsafe block | `silk_nsq_noise_shape_feedback_loop` | Public entry validates even shaping order and checks every coefficient window before accessing the fixed-size state. |
+| 293 | unsafe block | `silk_nsq_noise_shape_feedback_loop_order12` | Public entry validates even shaping order and checks every coefficient window before accessing the fixed-size state. |
+| 419 | unsafe block | `lpc_pred_order6` | Public entry bounds predictor order and subframe length; checked coefficient windows cover all unchecked reads. |
+| 460 | unsafe block | `lpc_pred_order10` | Public entry bounds predictor order and subframe length; checked coefficient windows cover all unchecked reads. |
+| 521 | unsafe block | `lpc_pred_order16` | Public entry bounds predictor order and subframe length; checked coefficient windows cover all unchecked reads. |
+| 612 | unsafe block | `lpc_pred_generic` | Public entry bounds predictor order and subframe length; checked coefficient windows cover all unchecked reads. |
 
 ## `src/silk/nsq_del_dec.rs` (8)
 
