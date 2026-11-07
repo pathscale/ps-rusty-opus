@@ -181,15 +181,44 @@ impl OpusMSEncoder {
         self.layout.nb_streams
     }
 
-    /// Encode one frame of interleaved `input` (nb_channels per sample) into a
-    /// multistream packet. `scratch` output is returned as a Vec.
+    /// Encode one frame of interleaved `input` into a multistream packet.
+    /// `frame_size` is the number of samples per channel; `input` must contain
+    /// at least `frame_size * nb_channels` samples. Any trailing samples are
+    /// ignored.
     ///
     /// # Errors
     ///
-    /// Any error from the per-stream [`crate::OpusEncoder::encode`] calls or from
-    /// assembling the self-delimited multistream packet.
+    /// Returns `BadArg` for an invalid frame duration or an input shorter than
+    /// the complete interleaved frame. Also returns errors from per-stream
+    /// [`crate::OpusEncoder::encode`] calls or self-delimited packet assembly.
     pub fn encode(&mut self, input: &[f32], frame_size: usize) -> Result<Vec<u8>, Error> {
+        // Validate the full request before allocating scratch or mutating any
+        // per-stream encoder state. Keep this duration set in sync with the
+        // single-stream encoder contract.
+        let fs = self.sample_rate as usize;
+        let valid = [
+            fs / 400,
+            fs / 200,
+            fs / 100,
+            fs / 50,
+            fs / 25,
+            3 * fs / 50,
+            4 * fs / 50,
+            5 * fs / 50,
+            6 * fs / 50,
+        ]
+        .contains(&frame_size);
+        if !valid || frame_size == 0 {
+            return Err(Error::BadArg("Invalid frame size for sampling rate"));
+        }
         let nch = self.layout.nb_channels;
+        let input_size = frame_size
+            .checked_mul(nch)
+            .ok_or(Error::BadArg("input size overflow"))?;
+        if input.len() < input_size {
+            return Err(Error::BadArg("input buffer too small"));
+        }
+
         let mut out: Vec<u8> = Vec::new();
         let mut stream_buf = vec![0f32; frame_size * 2];
         let mut pkt = vec![0u8; 1500 + frame_size];
@@ -439,5 +468,89 @@ impl OpusMSEncoder {
         for e in &mut self.encoders {
             e.max_bandwidth = bw;
         }
+    }
+}
+
+
+#[cfg(test)]
+mod multistream_encoder_preflight_tests {
+    use super::OpusMSEncoder;
+    use crate::{Application, Error};
+
+    fn encoder(channels: usize, family: i32) -> OpusMSEncoder {
+        OpusMSEncoder::new(48000, channels, family, Application::RestrictedLowDelay).unwrap()
+    }
+
+    fn pcm(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| ((i * 17 % 97) as f32 + 1.0) / 100.0)
+            .collect()
+    }
+
+    fn assert_input_too_small(result: Result<Vec<u8>, Error>) {
+        assert!(matches!(result, Err(Error::BadArg("input buffer too small"))));
+    }
+
+    #[test]
+    fn family_zero_mono_and_stereo_reject_empty_and_short_input() {
+        for channels in [1, 2] {
+            for input_len in [0, 120 * channels - 1] {
+                let mut enc = encoder(channels, 0);
+                assert_input_too_small(enc.encode(&pcm(input_len), 120));
+            }
+        }
+    }
+
+    #[test]
+    fn family_one_three_channel_mapping_rejects_short_input() {
+        let mut enc = encoder(3, 1);
+        assert_input_too_small(enc.encode(&pcm(359), 120));
+    }
+
+    #[test]
+    fn family_one_quad_rejects_before_any_stream_analysis_or_encoding() {
+        let mut after_rejection = encoder(4, 1);
+        let mut fresh = encoder(4, 1);
+        assert_input_too_small(after_rejection.encode(&pcm(479), 120));
+        assert!(after_rejection
+            .encoders
+            .iter()
+            .all(|encoder| !encoder.tonality.initialized()));
+
+        let full = pcm(480);
+        let after_packet = after_rejection.encode(&full, 120).unwrap();
+        let fresh_packet = fresh.encode(&full, 120).unwrap();
+        assert_eq!(after_packet, fresh_packet);
+    }
+
+    #[test]
+    fn family_one_eight_channel_layout_rejects_short_input() {
+        let mut enc = encoder(8, 1);
+        assert_input_too_small(enc.encode(&pcm(120 * 8 - 1), 120));
+    }
+
+    #[test]
+    fn invalid_frame_sizes_precede_empty_input_validation() {
+        let mut enc = encoder(8, 1);
+        for frame_size in [0, 48, usize::MAX] {
+            assert!(matches!(
+                enc.encode(&[], frame_size),
+                Err(Error::BadArg("Invalid frame size for sampling rate"))
+            ));
+        }
+    }
+
+    #[test]
+    fn family_one_three_channel_encoding_ignores_trailing_samples() {
+        let prefix = pcm(360);
+        let mut with_trailing = prefix.clone();
+        with_trailing.extend(std::iter::repeat(0.91f32).take(11));
+
+        let mut exact_encoder = encoder(3, 1);
+        let mut trailing_encoder = encoder(3, 1);
+        let exact_packet = exact_encoder.encode(&prefix, 120).unwrap();
+        let trailing_packet = trailing_encoder.encode(&with_trailing, 120).unwrap();
+        assert!(!exact_packet.is_empty());
+        assert_eq!(exact_packet, trailing_packet);
     }
 }
