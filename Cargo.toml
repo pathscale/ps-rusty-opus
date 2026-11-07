@@ -2,7 +2,7 @@
 edition = "2024"
 authors = ["jinti<shenjindi@fourz.cn>", "Remade-With-Rust"]
 name = "ps-rusty-opus"
-version = "1.0.0"
+version = "1.0.1"
 description = "Synchronous fork of rusty-opus 1.0.0 for chuzz: pure-Rust Opus (RFC 6716) with the threaded encoding module removed"
 license = "BSD-3-Clause"
 repository = "https://github.com/pathscale/ps-rusty-opus"

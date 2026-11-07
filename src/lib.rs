@@ -2629,6 +2629,23 @@ impl OpusDecoder {
             // between mono and stereo). Decode it at its native channel count in
             // a persistent auxiliary decoder, then render to our output count:
             // mono->stereo duplicates, stereo->mono averages the two channels.
+            let frames = repacketizer::parse_frames(input, false)?;
+            let packet_samples = frames
+                .count
+                .checked_mul(
+                    repacketizer::samples_per_frame(toc, self.sampling_rate) as usize,
+                )
+                .ok_or(Error::BufferTooSmall("auxiliary frame size overflow"))?;
+            if packet_samples > frame_size {
+                return Err(Error::BufferTooSmall("auxiliary frame buffer too small"));
+            }
+            let output_needed = packet_samples
+                .checked_mul(self.channels)
+                .ok_or(Error::BufferTooSmall("auxiliary output size overflow"))?;
+            if output.len() < output_needed {
+                return Err(Error::BufferTooSmall("auxiliary output buffer too small"));
+            }
+
             if self
                 .aux
                 .as_ref()
@@ -2657,8 +2674,17 @@ impl OpusDecoder {
             let Some(aux) = self.aux.as_mut() else {
                 return Err(Error::Internal("auxiliary decoder missing"));
             };
-            let mut buf = vec![0.0f32; frame_size * packet_channels];
+            let scratch_len = packet_samples
+                .checked_mul(packet_channels)
+                .ok_or(Error::BufferTooSmall("auxiliary frame size overflow"))?;
+            let mut buf = vec![0.0f32; scratch_len];
             let n = aux.decode(input, frame_size, &mut buf)?;
+            let needed = n
+                .checked_mul(self.channels)
+                .ok_or(Error::BufferTooSmall("auxiliary output size overflow"))?;
+            if output.len() < needed {
+                return Err(Error::BufferTooSmall("auxiliary output buffer too small"));
+            }
             self.last_range = aux.last_range;
             if packet_channels == 1 && self.channels == 2 {
                 for i in 0..n {
