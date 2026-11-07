@@ -930,6 +930,7 @@ impl OpusEncoder {
     ///
     /// [`Error::BadArg`] if `frame_size` is not a valid Opus frame duration
     /// (2.5–120 ms) at this sampling rate or for the selected mode;
+    /// [`Error::BadArg`] if `input` contains fewer interleaved samples than the frame requires;
     /// [`Error::BufferTooSmall`] if `output` cannot hold the packet;
     /// [`Error::Internal`] if a codec stage fails.
     pub fn encode(
@@ -962,6 +963,12 @@ impl OpusEncoder {
         .contains(&frame_size);
         if !valid || frame_size == 0 {
             return Err(Error::BadArg("Invalid frame size for sampling rate"));
+        }
+        let input_size = frame_size
+            .checked_mul(self.channels)
+            .ok_or(Error::BadArg("input size overflow"))?;
+        if input.len() < input_size {
+            return Err(Error::BadArg("input buffer too small"));
         }
         // libopus: frame_rate = Fs/frame_size (integer; 16 for 60 ms).
         let frame_rate = self.sampling_rate / frame_size as i32;
@@ -4027,4 +4034,81 @@ mod tests {
             "Audio/48kHz encoder with frame_size=48 should return Err"
         );
     }
+
+    fn assert_input_too_small(result: Result<usize, Error>) {
+        assert!(matches!(result, Err(Error::BadArg("input buffer too small"))));
+    }
+
+    #[test]
+    fn encoder_input_preflight_rejects_empty_and_short_mono_and_stereo() {
+        for channels in [1, 2] {
+            for input_len in [0, 120 * channels - 1] {
+                let mut enc = OpusEncoder::new(48000, channels, Application::Audio).unwrap();
+                let input = vec![0.25; input_len];
+                let mut output = vec![0xA5; 1500];
+                assert_input_too_small(enc.encode(&input, 120, &mut output));
+                assert!(output.iter().all(|&byte| byte == 0xA5));
+            }
+        }
+    }
+
+    #[test]
+    fn encoder_input_preflight_rejects_nonzero_restricted_low_delay_stereo() {
+        let mut enc = OpusEncoder::new(48000, 2, Application::RestrictedLowDelay).unwrap();
+        enc.complexity = 0;
+        let input = vec![0.25; 239];
+        let mut output = vec![0x5A; 1500];
+        assert_input_too_small(enc.encode(&input, 120, &mut output));
+        assert!(output.iter().all(|&byte| byte == 0x5A));
+    }
+
+    #[test]
+    fn encoder_input_preflight_rejection_does_not_mutate_encoder_state() {
+        let mut after_rejection = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
+        let mut fresh = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
+        let short = vec![0.2; 959];
+        let mut rejected_output = vec![0xCC; 1500];
+        assert_input_too_small(after_rejection.encode(&short, 960, &mut rejected_output));
+        assert!(!after_rejection.tonality.initialized());
+        assert!(rejected_output.iter().all(|&byte| byte == 0xCC));
+
+        let full = vec![0.2; 960];
+        let mut after_packet = vec![0u8; 1500];
+        let mut fresh_packet = vec![0u8; 1500];
+        let after_len = after_rejection.encode(&full, 960, &mut after_packet).unwrap();
+        let fresh_len = fresh.encode(&full, 960, &mut fresh_packet).unwrap();
+        assert_eq!(after_len, fresh_len);
+        assert_eq!(&after_packet[..after_len], &fresh_packet[..fresh_len]);
+    }
+
+    #[test]
+    fn encoder_input_preflight_accepts_exact_and_trailing_samples() {
+        for input_len in [120, 121] {
+            let mut enc = OpusEncoder::new(48000, 1, Application::RestrictedLowDelay).unwrap();
+            enc.complexity = 0;
+            let input = vec![0.1; input_len];
+            let mut output = vec![0u8; 1500];
+            assert!(enc.encode(&input, 120, &mut output).is_ok());
+        }
+    }
+
+    #[test]
+    fn encoder_input_preflight_preserves_existing_error_precedence() {
+        let mut enc = OpusEncoder::new(48000, 1, Application::Audio).unwrap();
+        let short = [0.1; 119];
+        let mut too_small_output = [0xA5; 1];
+        assert!(matches!(
+            enc.encode(&short, 120, &mut too_small_output),
+            Err(Error::BufferTooSmall("Output buffer too small"))
+        ));
+        assert_eq!(too_small_output, [0xA5; 1]);
+
+        let mut output = [0xA5; 1500];
+        assert!(matches!(
+            enc.encode(&[], 48, &mut output),
+            Err(Error::BadArg("Invalid frame size for sampling rate"))
+        ));
+        assert!(output.iter().all(|&byte| byte == 0xA5));
+    }
+
 }
