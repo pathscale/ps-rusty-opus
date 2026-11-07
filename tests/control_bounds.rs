@@ -42,3 +42,45 @@ fn extreme_loss_matches_clamped_loss() {
         }
     }
 }
+
+#[test]
+fn extreme_positive_audio_rate_is_rejected_without_state_or_output_changes() {
+    let mut encoder = OpusEncoder::new(8000, 1, Application::Audio).unwrap();
+    let mut fresh = OpusEncoder::new(8000, 1, Application::Audio).unwrap();
+    encoder.bitrate_bps = i32::MAX;
+    let pcm = [0.0; 160];
+    let mut output = [0xA5; 1276];
+
+    assert!(matches!(
+        encoder.encode(&pcm, 160, &mut output),
+        Err(rusty_opus::Error::BadArg(
+            "SILK packet rate budget is not representable"
+        ))
+    ));
+    assert_eq!(output, [0xA5; 1276]);
+
+    encoder.bitrate_bps = fresh.bitrate_bps;
+    let mut actual = [0; 1276];
+    let mut expected = [0; 1276];
+    let actual_len = encoder.encode(&pcm, 160, &mut actual).unwrap();
+    let expected_len = fresh.encode(&pcm, 160, &mut expected).unwrap();
+    assert_eq!(&actual[..actual_len], &expected[..expected_len]);
+}
+
+#[test]
+fn audio_silk_ignores_pcm_after_the_validated_frame() {
+    let mut exact_encoder = OpusEncoder::new(8000, 1, Application::Audio).unwrap();
+    let mut trailing_encoder = OpusEncoder::new(8000, 1, Application::Audio).unwrap();
+    let pcm = [0.125; 160];
+    let mut trailing_pcm = [0.125; 161];
+    trailing_pcm[160] = -1.0;
+    let mut exact_output = [0; 1276];
+    let mut trailing_output = [0; 1276];
+
+    let exact_len = exact_encoder.encode(&pcm, 160, &mut exact_output).unwrap();
+    let trailing_len = trailing_encoder
+        .encode(&trailing_pcm, 160, &mut trailing_output)
+        .unwrap();
+    assert_eq!(trailing_len, exact_len);
+    assert_eq!(&trailing_output[..trailing_len], &exact_output[..exact_len]);
+}

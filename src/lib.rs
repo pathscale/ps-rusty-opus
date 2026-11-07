@@ -970,6 +970,14 @@ impl OpusEncoder {
         if input.len() < input_size {
             return Err(Error::BadArg("input buffer too small"));
         }
+        // Packet-rate arithmetic must remain representable before mode selection.
+        // Automatic mode selection can reach SILK, so enforce this for every mode.
+        if self.bitrate_bps.checked_mul((frame_size as i32 * 1000) / self.sampling_rate).is_none() {
+            return Err(Error::BadArg("SILK packet rate budget is not representable"));
+        }
+        // Trailing PCM is allowed by the API, but only the validated frame is
+        // consumed by analysis and the codec paths.
+        let input = &input[..input_size];
         // Validate public controls after the established input preflight and
         // before analysis or any encoder/output state changes.
         if !(0..=10).contains(&self.complexity) {
