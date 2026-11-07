@@ -388,20 +388,20 @@ fn open_gate_tap() -> Option<std::io::BufWriter<std::fs::File>> {
 /// opus_encoder.c compute_redundancy_bytes.
 fn compute_redundancy_bytes(
     max_data_bytes: usize,
-    bitrate_bps: i32,
-    frame_rate: i32,
+    bitrate_bps: i64,
+    frame_rate: i64,
     channels: usize,
 ) -> usize {
-    let base_bits = 40 * channels as i32 + 20;
+    let base_bits = 40i64 * channels as i64 + 20;
     // Equivalent rate for 5 ms frames; 1.5x for VBR (short, avoids artefacts).
     let redundancy_rate = bitrate_bps + base_bits * (200 - frame_rate);
     let redundancy_rate = 3 * redundancy_rate / 2;
     let mut redundancy_bytes = redundancy_rate / 1600;
     // The max rate we can use given CBR or VBR with cap.
-    let available_bits = max_data_bytes as i32 * 8 - 2 * base_bits;
+    let available_bits = max_data_bytes as i64 * 8 - 2 * base_bits;
     let cap = (available_bits * 240 / (240 + 48000 / frame_rate) + base_bits) / 8;
-    redundancy_bytes = redundancy_bytes.min(cap);
-    if redundancy_bytes > 4 + 8 * channels as i32 {
+    redundancy_bytes = redundancy_bytes.min(cap).max(0);
+    if redundancy_bytes > 4 + 8 * channels as i64 {
         redundancy_bytes.min(257) as usize
     } else {
         0
@@ -415,17 +415,17 @@ fn compute_equiv_rate(
     vbr: bool,
     complexity: i32,
     loss: i32,
-) -> i32 {
-    let mut equiv = bitrate;
+) -> i64 {
+    let mut equiv = bitrate as i64;
     if frame_rate > 50 {
-        equiv -= (40 * channels as i32 + 20) * (frame_rate - 50);
+        equiv -= (40 * channels as i64 + 20) * (frame_rate as i64 - 50);
     }
     if !vbr {
         equiv -= equiv / 12;
     }
-    equiv = equiv * (90 + complexity) / 100;
+    equiv = equiv * (90 + complexity as i64) / 100;
     if loss > 0 {
-        equiv -= equiv * loss / (12 * loss + 20);
+        equiv -= equiv * loss as i64 / (12 * loss as i64 + 20);
     }
     equiv
 }
@@ -970,8 +970,38 @@ impl OpusEncoder {
         if input.len() < input_size {
             return Err(Error::BadArg("input buffer too small"));
         }
+        // Validate public controls after the established input preflight and
+        // before analysis or any encoder/output state changes.
+        if !(0..=10).contains(&self.complexity) {
+            return Err(Error::BadArg("complexity must be between 0 and 10"));
+        }
+        if self.bitrate_bps < 0 {
+            return Err(Error::BadArg("bitrate must not be negative"));
+        }
+        let packet_loss_perc = self.packet_loss_perc.clamp(0, 100);
         // libopus: frame_rate = Fs/frame_size (integer; 16 for 60 ms).
         let frame_rate = self.sampling_rate / frame_size as i32;
+        let target_bits = self.bitrate_bps as i64 * frame_size as i64
+            / self.sampling_rate as i64;
+        let max_data_bytes = output.len().min(1276);
+        // Apply the existing packet byte ceiling while the budget is still
+        // wide; a large configured rate must not wrap through usize.
+        let cbr_bytes = ((target_bits + 4) / 8)
+            .clamp(1, max_data_bytes as i64) as usize;
+        let n_bytes = if self.use_cbr {
+            cbr_bytes
+        } else {
+            max_data_bytes.max(cbr_bytes).max(3)
+        };
+        let celt_vbr_rate = if self.use_cbr {
+            0
+        } else {
+            let den = self.sampling_rate >> 3;
+            let rate = (self.bitrate_bps as i64 * frame_size as i64 + (den >> 1) as i64)
+                / den as i64;
+            i32::try_from(rate)
+                .map_err(|_| Error::BadArg("CELT rate budget is not representable"))?
+        };
 
         // ---- Tonality analysis (opus_encoder.c:1123) ----
         // A multi-frame packet's sub-frames skip it: the whole packet was
@@ -1064,7 +1094,7 @@ impl OpusEncoder {
                 frame_rate,
                 !self.use_cbr,
                 self.complexity,
-                self.packet_loss_perc,
+                packet_loss_perc,
             );
             let prev_was_celt = self.prev_enc_mode == Some(OpusMode::CeltOnly);
             let has_prev_mode = self.prev_enc_mode.is_some();
@@ -1076,7 +1106,7 @@ impl OpusEncoder {
                 has_prev_mode,
                 voice_est,
             );
-            if equiv >= threshold && self.sampling_rate >= 24000 {
+            if equiv >= threshold as i64 && self.sampling_rate >= 24000 {
                 OpusMode::CeltOnly
             } else {
                 OpusMode::SilkOnly
@@ -1104,7 +1134,7 @@ impl OpusEncoder {
                 frame_rate,
                 !self.use_cbr,
                 self.complexity,
-                self.packet_loss_perc,
+                packet_loss_perc,
             );
             let voice_est: i32 = self.compute_voice_est();
             let (vt, mt) = if self.channels == 2 {
@@ -1141,7 +1171,7 @@ impl OpusEncoder {
                         threshold += hysteresis;
                     }
                 }
-                if equiv >= threshold {
+                if equiv >= threshold as i64 {
                     break;
                 }
                 bw -= 1;
@@ -1205,7 +1235,7 @@ impl OpusEncoder {
                 && self.force_bandwidth.is_none()
                 && mode != OpusMode::CeltOnly
             {
-                let ch = self.channels as i32;
+                let ch = self.channels as i64;
                 let equiv2 = equiv; // same 20-ms equivalent rate as the walk
                 let min_det = if equiv2 <= 18000 * ch && mode == OpusMode::CeltOnly {
                     NB
@@ -1501,25 +1531,13 @@ impl OpusEncoder {
             self.nb_no_activity_ms_q1 = 0;
         }
 
-        let target_bits =
-            (self.bitrate_bps as i64 * frame_size as i64 / self.sampling_rate as i64) as i32;
-        let cbr_bytes = ((target_bits + 4) / 8) as usize;
         // opus_encode_native: no single Opus frame exceeds 1275 bytes (+1 TOC),
         // whatever the caller's buffer; CBR at a high rate must not plan more.
-        let max_data_bytes = output.len().min(1276);
 
         // CBR: the packet is exactly the target size. VBR: start the coder on a
         // generous buffer — SILK-only packets end at whatever SILK produced, and
         // the CELT layer picks its own frame size (compute_vbr) and shrinks the
         // coder to it (libopus opus_encoder.c / celt_encoder.c VBR flow).
-        let n_bytes = if self.use_cbr {
-            cbr_bytes.min(max_data_bytes).max(1)
-        } else {
-            max_data_bytes
-                .min(1276)
-                .max(cbr_bytes.min(max_data_bytes))
-                .max(3)
-        };
 
         // Redundant-frame budget (opus_encoder.c compute_redundancy_bytes); too
         // few bytes to be worth it -> rely on the decoder's transition PLC.
@@ -1529,7 +1547,12 @@ impl OpusEncoder {
         }
         if redundancy {
             redundancy_bytes =
-                compute_redundancy_bytes(n_bytes, self.bitrate_bps, frame_rate, self.channels);
+                compute_redundancy_bytes(
+                    n_bytes,
+                    self.bitrate_bps as i64,
+                    frame_rate as i64,
+                    self.channels,
+                );
             if redundancy_bytes == 0 {
                 redundancy = false;
             }
@@ -1617,7 +1640,7 @@ impl OpusEncoder {
             }
 
             self.silk_enc.s_cmn.use_in_band_fec = i32::from(self.use_inband_fec);
-            self.silk_enc.s_cmn.packet_loss_perc = self.packet_loss_perc.clamp(0, 100);
+            self.silk_enc.s_cmn.packet_loss_perc = packet_loss_perc;
 
             let lbrr_in_previous_packet = self.silk_enc.s_cmn.lbrr_enabled != 0;
             self.silk_enc.s_cmn.lbrr_enabled = i32::from(self.use_inband_fec);
@@ -1627,7 +1650,7 @@ impl OpusEncoder {
             // step shrinks as loss rises, max(7 - 0.4 loss%, 2). FEC-off path
             // unaffected.
             self.silk_enc.s_cmn.lbrr_gain_increases = if lbrr_in_previous_packet {
-                (7 - ((self.packet_loss_perc.clamp(0, 100) * 26214) >> 16)).max(2)
+                (7 - ((packet_loss_perc * 26214) >> 16)).max(2)
             } else {
                 7
             };
@@ -1916,7 +1939,7 @@ impl OpusEncoder {
             // prefilter loss ladder (celt.rs) and coarse-energy intra bias were
             // dead even with OPUS_SET_PACKET_LOSS_PERC set. Default 0 = no
             // change on the default path (libopus opus_encoder.c parity).
-            self.celt_enc.loss_rate = self.packet_loss_perc;
+            self.celt_enc.loss_rate = packet_loss_perc;
             let start_band = if mode == OpusMode::Hybrid { 17 } else { 0 };
             // CELT end band from the coded bandwidth (mirrors the decoder's
             // celt_endband_for_bandwidth): NB->13, MB/WB->17, SWB->19, FB->21.
@@ -1927,13 +1950,7 @@ impl OpusEncoder {
             // frame's size (compute_vbr) and shrinks the range coder to it. The
             // hybrid target covers the whole packet (CELT adds back the SILK
             // bits via `target += tell`).
-            self.celt_enc.vbr_rate = if self.use_cbr {
-                0
-            } else {
-                let den = self.sampling_rate >> 3; // Fs >> BITRES
-                ((self.bitrate_bps as i64 * frame_size as i64 + (den >> 1) as i64) / den as i64)
-                    as i32
-            };
+            self.celt_enc.vbr_rate = celt_vbr_rate;
 
             let celt_input: &[f32] = if self.channels == 1 {
                 input
@@ -1973,7 +1990,7 @@ impl OpusEncoder {
             enc.upsample = (48000 / self.sampling_rate) as usize;
             enc.complexity = self.complexity;
             enc.lsb_depth = self.lsb_depth;
-            enc.loss_rate = self.packet_loss_perc;
+            enc.loss_rate = packet_loss_perc;
             enc.analysis = celt_analysis;
             enc.prediction_off = true;
             enc.vbr_rate = 0;
@@ -2093,7 +2110,7 @@ impl OpusEncoder {
                 frame_rate,
                 !self.use_cbr,
                 self.complexity,
-                self.packet_loss_perc,
+                packet_loss_perc,
             );
             let voice_est = self.compute_voice_est();
             let (clip, frame) = (self.gate_clip.clone(), self.gate_frame);
