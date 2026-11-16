@@ -19,24 +19,24 @@ Columns: location, kind, enclosing function, and the first line of the justifica
 |---:|---|---|---|
 | 261 | unsafe fn | `stereo_itheta_neon` | - NEON must be available (baseline on aarch64; |
 | 416 | unsafe block | `stereo_itheta` | the `isa::neon()` check above guarantees NEON. |
-| 1312 | unsafe block | `quant_partition` | `neon` is `isa::neon()`, so NEON is available. |
-| 1385 | unsafe fn | `deinterleave_hadamard_neon` | No safety precondition remains: the body is entirely safe code. |
-| 1428 | unsafe block | `deinterleave_hadamard` | the kernel has no remaining precondition: `tmp` and `x` accesses are bounds-checked. |
-| 1452 | unsafe fn | `interleave_hadamard_neon` | No safety precondition remains: the body is entirely safe code. |
-| 1495 | unsafe block | `interleave_hadamard` | the kernel has no remaining precondition: `tmp` and `x` accesses are bounds-checked. |
-| 2340 | unsafe block | `compute_band_energy_neon` | NEON is a baseline feature of the aarch64 targets this crate builds for (the caller additionally gates on `isa::neon()`). |
-| 2396 | unsafe fn | `compute_band_energy_avx2` | - The CPU must support AVX2 and FMA (`#[target_feature(enable = "avx2,fma")]`); |
-| 2471 | unsafe block | `compute_band_energies` | `use_avx2` is `isa::avx2_fma()`, matching the kernel's `avx2,fma` target features; |
-| 2534 | unsafe block | `normalise_bands` | `use_avx2` is `isa::avx2()`, matching the kernel's `avx2` target feature; |
-| 2542 | unsafe block | `normalise_bands` | `isa::neon()` was checked in the condition; |
-| 2564 | unsafe fn | `scale_slice_avx2` | - The CPU must support AVX2 (`#[target_feature(enable = "avx2")]`); |
-| 2602 | unsafe fn | `scale_slice_neon` | - NEON must be available (baseline on aarch64; |
-| 2674 | unsafe block | `denormalise_bands` | `use_avx2` is `isa::avx2()`, matching the kernel's `avx2` target feature; |
-| 2682 | unsafe block | `denormalise_bands` | `isa::neon()` was checked in the condition; |
-| 2708 | unsafe fn | `renormalise_vector_neon` | - NEON must be available (baseline on aarch64; |
-| 2795 | unsafe fn | `renormalise_vector_avx2` | - The CPU must support AVX2 and FMA (`#[target_feature(enable = "avx2,fma")]`); |
-| 2861 | unsafe block | `renormalise_vector` | `isa::neon()` was checked above. |
-| 2869 | unsafe block | `renormalise_vector` | `isa::avx2_fma()` in the condition matches the kernel's `avx2,fma` target features. |
+| 1323 | unsafe block | `quant_partition` | `neon` is `isa::neon()`, so NEON is available. |
+| 1396 | unsafe fn | `deinterleave_hadamard_neon` | No safety precondition remains: the body is entirely safe code. |
+| 1439 | unsafe block | `deinterleave_hadamard` | the kernel has no remaining precondition: `tmp` and `x` accesses are bounds-checked. |
+| 1463 | unsafe fn | `interleave_hadamard_neon` | No safety precondition remains: the body is entirely safe code. |
+| 1506 | unsafe block | `interleave_hadamard` | the kernel has no remaining precondition: `tmp` and `x` accesses are bounds-checked. |
+| 2351 | unsafe block | `compute_band_energy_neon` | NEON is a baseline feature of the aarch64 targets this crate builds for (the caller additionally gates on `isa::neon()`). |
+| 2407 | unsafe fn | `compute_band_energy_avx2` | - The CPU must support AVX2 and FMA (`#[target_feature(enable = "avx2,fma")]`); |
+| 2482 | unsafe block | `compute_band_energies` | `use_avx2` is `isa::avx2_fma()`, matching the kernel's `avx2,fma` target features; |
+| 2545 | unsafe block | `normalise_bands` | `use_avx2` is `isa::avx2()`, matching the kernel's `avx2` target feature; |
+| 2553 | unsafe block | `normalise_bands` | `isa::neon()` was checked in the condition; |
+| 2575 | unsafe fn | `scale_slice_avx2` | - The CPU must support AVX2 (`#[target_feature(enable = "avx2")]`); |
+| 2613 | unsafe fn | `scale_slice_neon` | - NEON must be available (baseline on aarch64; |
+| 2685 | unsafe block | `denormalise_bands` | `use_avx2` is `isa::avx2()`, matching the kernel's `avx2` target feature; |
+| 2693 | unsafe block | `denormalise_bands` | `isa::neon()` was checked in the condition; |
+| 2719 | unsafe fn | `renormalise_vector_neon` | - NEON must be available (baseline on aarch64; |
+| 2806 | unsafe fn | `renormalise_vector_avx2` | - The CPU must support AVX2 and FMA (`#[target_feature(enable = "avx2,fma")]`); |
+| 2872 | unsafe block | `renormalise_vector` | `isa::neon()` was checked above. |
+| 2880 | unsafe block | `renormalise_vector` | `isa::avx2_fma()` in the condition matches the kernel's `avx2,fma` target features. |
 
 ## `src/celt.rs` (15)
 
@@ -111,7 +111,7 @@ Columns: location, kind, enclosing function, and the first line of the justifica
 | 763 | unsafe block | `mdct_post_rotation_neon` | NEON is baseline on aarch64, so the intrinsics are available. |
 | 853 | unsafe block | `mdct_backward_pre_rotation_neon` | NEON is baseline on aarch64, so the intrinsics are available. |
 | 928 | unsafe block | `mdct_backward_post_rotation_neon` | the only caller, `MdctLookup::backward`, runs `assert!(output.len() >= overlap2 + n2)` before calling, so `out_base = output + overlap2` is in bounds  |
-| 1034 | unsafe block | `mdct_tdac_neon` | NEON is baseline on aarch64, so the intrinsics are available. |
+| 1031 | unsafe block | `mdct_tdac_neon` | NEON is baseline on aarch64, so the intrinsics are available. |
 
 ## `src/pitch.rs` (28)
 
@@ -194,12 +194,12 @@ Columns: location, kind, enclosing function, and the first line of the justifica
 
 | Line | Kind | Function | Justification (first line) |
 |---:|---|---|---|
-| 227 | unsafe block | `silk_nsq_noise_shape_feedback_loop` | every index touched is in `0..order`. |
-| 264 | unsafe block | `silk_nsq_noise_shape_feedback_loop_order12` | indices 0..=11 only. |
-| 394 | unsafe block | `lpc_pred_order6` | reads `s_lpc[idx - 5..=idx]` and `a_q12[0..6]`. |
-| 439 | unsafe block | `lpc_pred_order10` | reads `s_lpc[idx - 9..=idx]` and `a_q12[0..10]`. |
-| 504 | unsafe block | `lpc_pred_order16` | reads `s_lpc[idx - 15..=idx]` and `a_q12[0..16]`. |
-| 599 | unsafe block | `lpc_pred_generic` | requires `order <= 16`: then `idx - j >= idx - 15 >= 0` (`idx = NSQ_LPC_BUF_LENGTH - 1 + i`), `idx < s_lpc.len()` (see `lpc_pred_order16`), and `j < 1 |
+| 375 | unsafe block | `silk_nsq_noise_shape_feedback_loop` | Public entry validates even shaping order and checks every coefficient window before accessing the fixed-size state. |
+| 410 | unsafe block | `silk_nsq_noise_shape_feedback_loop_order12` | Public entry validates even shaping order and checks every coefficient window before accessing the fixed-size state. |
+| 536 | unsafe block | `lpc_pred_order6` | Public entry bounds predictor order and subframe length; checked coefficient windows cover all unchecked reads. |
+| 577 | unsafe block | `lpc_pred_order10` | Public entry bounds predictor order and subframe length; checked coefficient windows cover all unchecked reads. |
+| 638 | unsafe block | `lpc_pred_order16` | Public entry bounds predictor order and subframe length; checked coefficient windows cover all unchecked reads. |
+| 729 | unsafe block | `lpc_pred_generic` | Public entry bounds predictor order and subframe length; checked coefficient windows cover all unchecked reads. |
 
 ## `src/silk/nsq_del_dec.rs` (8)
 
@@ -207,12 +207,12 @@ Columns: location, kind, enclosing function, and the first line of the justifica
 |---:|---|---|---|
 | 142 | unsafe fn | `silk_lpc_prediction_neon` | - The CPU must support NEON (`crate::isa::neon()`; |
 | 211 | unsafe fn | `silk_lpc_prediction_avx2` | - The CPU must support AVX2 (the kernel is compiled with `#[target_feature(enable = "avx2")]`); |
-| 309 | unsafe block | `silk_noise_shape_quantizer_short_prediction` | NEON confirmed by `isa::neon()`; |
-| 320 | unsafe block | `silk_noise_shape_quantizer_short_prediction` | `lpc_avx2_enabled()` is `crate::isa::avx2()`, matching the kernel's `avx2` target feature; |
-| 399 | unsafe fn | `nsq_shape_filter_soa_avx2` | The CPU must support AVX2 (the kernel is compiled with `#[target_feature(enable = "avx2")]`). |
-| 473 | unsafe block | `nsq_shape_filter_soa` | `nsq_shape_avx2_enabled()` returns true only if `crate::isa::avx2()` does, which checks exactly the `avx2` feature the kernel is compiled with. |
-| 516 | unsafe block | `avx2_matches_scalar` | the test returns early unless `is_x86_feature_detected!("avx2")`. |
-| 565 | unsafe block | `nsq_shape_filter_avx2_matches_scalar` | the test returns early unless `is_x86_feature_detected!("avx2")`; |
+| 312 | unsafe block | `silk_noise_shape_quantizer_short_prediction` | NEON confirmed by `isa::neon()`; |
+| 323 | unsafe block | `silk_noise_shape_quantizer_short_prediction` | `lpc_avx2_enabled()` is `crate::isa::avx2()`, matching the kernel's `avx2` target feature; |
+| 402 | unsafe fn | `nsq_shape_filter_soa_avx2` | The CPU must support AVX2 (the kernel is compiled with `#[target_feature(enable = "avx2")]`). |
+| 476 | unsafe block | `nsq_shape_filter_soa` | `nsq_shape_avx2_enabled()` returns true only if `crate::isa::avx2()` does, which checks exactly the `avx2` feature the kernel is compiled with. |
+| 519 | unsafe block | `avx2_matches_scalar` | the test returns early unless `is_x86_feature_detected!("avx2")`. |
+| 568 | unsafe block | `nsq_shape_filter_avx2_matches_scalar` | the test returns early unless `is_x86_feature_detected!("avx2")`; |
 
 ## `src/silk/resampler.rs` (2)
 

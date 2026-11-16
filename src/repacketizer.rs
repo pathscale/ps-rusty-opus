@@ -184,6 +184,7 @@ pub(crate) fn parse_frames(data: &[u8], self_delimited: bool) -> Result<Frames, 
     let mut len = data.len() as i32 - 1;
     let mut cbr = false;
     let mut last_size = len;
+    let mut padding_bytes = 0usize;
     let mut sizes = SizeList::new();
 
     let count: usize = match toc & 0x3 {
@@ -235,6 +236,9 @@ pub(crate) fn parse_frames(data: &[u8], self_delimited: bool) -> Result<Frames, 
                     len -= 1;
                     let tmp = if p == 255 { 254 } else { p as i32 };
                     len -= tmp;
+                    padding_bytes = padding_bytes
+                        .checked_add(tmp as usize)
+                        .ok_or(Error::InvalidPacket("invalid packet"))?;
                     if p != 255 {
                         break;
                     }
@@ -317,12 +321,20 @@ pub(crate) fn parse_frames(data: &[u8], self_delimited: bool) -> Result<Frames, 
         *slot = (off, s as usize);
         off += s as usize;
     }
+    // Padding bytes follow the coded frame payload. Include them in `end` so
+    // callers parsing concatenated self-delimited streams advance to the next
+    // stream instead of treating padding as its first byte.
+    let end = off
+        .checked_add(padding_bytes)
+        .filter(|&end| end <= data.len())
+        .ok_or(Error::InvalidPacket("invalid packet"))?;
+
     // `end` is where a self-delimited multistream packet's next stream begins.
     Ok(Frames {
         toc,
         count: sizes.as_slice().len(),
         ranges,
-        end: off,
+        end,
     })
 }
 

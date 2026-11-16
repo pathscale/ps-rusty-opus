@@ -13,6 +13,7 @@
 use crate::Error;
 use crate::repacketizer::{Repacketizer, parse_frames};
 use crate::{Application, Bandwidth, OpusDecoder, OpusEncoder};
+use std::borrow::Cow;
 
 /// Vorbis channel layout for mapping family 1, channels 1..=8:
 /// (nb_streams, nb_coupled_streams, channel_mapping).
@@ -180,15 +181,44 @@ impl OpusMSEncoder {
         self.layout.nb_streams
     }
 
-    /// Encode one frame of interleaved `input` (nb_channels per sample) into a
-    /// multistream packet. `scratch` output is returned as a Vec.
+    /// Encode one frame of interleaved `input` into a multistream packet.
+    /// `frame_size` is the number of samples per channel; `input` must contain
+    /// at least `frame_size * nb_channels` samples. Any trailing samples are
+    /// ignored.
     ///
     /// # Errors
     ///
-    /// Any error from the per-stream [`crate::OpusEncoder::encode`] calls or from
-    /// assembling the self-delimited multistream packet.
+    /// Returns `BadArg` for an invalid frame duration or an input shorter than
+    /// the complete interleaved frame. Also returns errors from per-stream
+    /// [`crate::OpusEncoder::encode`] calls or self-delimited packet assembly.
     pub fn encode(&mut self, input: &[f32], frame_size: usize) -> Result<Vec<u8>, Error> {
+        // Validate the full request before allocating scratch or mutating any
+        // per-stream encoder state. Keep this duration set in sync with the
+        // single-stream encoder contract.
+        let fs = self.sample_rate as usize;
+        let valid = [
+            fs / 400,
+            fs / 200,
+            fs / 100,
+            fs / 50,
+            fs / 25,
+            3 * fs / 50,
+            4 * fs / 50,
+            5 * fs / 50,
+            6 * fs / 50,
+        ]
+        .contains(&frame_size);
+        if !valid || frame_size == 0 {
+            return Err(Error::BadArg("Invalid frame size for sampling rate"));
+        }
         let nch = self.layout.nb_channels;
+        let input_size = frame_size
+            .checked_mul(nch)
+            .ok_or(Error::BadArg("input size overflow"))?;
+        if input.len() < input_size {
+            return Err(Error::BadArg("input buffer too small"));
+        }
+
         let mut out: Vec<u8> = Vec::new();
         let mut stream_buf = vec![0f32; frame_size * 2];
         let mut pkt = vec![0u8; 1500 + frame_size];
@@ -247,6 +277,7 @@ impl OpusMSEncoder {
 pub struct OpusMSDecoder {
     layout: ChannelLayout,
     decoders: Vec<OpusDecoder>,
+    sample_rate: i32,
 }
 
 impl OpusMSDecoder {
@@ -264,16 +295,26 @@ impl OpusMSDecoder {
             let ch = if s < layout.nb_coupled_streams { 2 } else { 1 };
             decoders.push(OpusDecoder::new(sample_rate, ch)?);
         }
-        Ok(Self { layout, decoders })
+        Ok(Self {
+            layout,
+            decoders,
+            sample_rate,
+        })
     }
 
     /// Decode a multistream packet into interleaved `output` (nb_channels per
     /// sample). Returns the number of samples per channel.
     ///
+    /// An empty `packet` marks a lost packet: every stream runs packet-loss
+    /// concealment for `frame_size` samples, at most 120 ms per call.
+    ///
     /// # Errors
     ///
     /// [`Error::InvalidPacket`] if the multistream framing is malformed, or any
-    /// error from the per-stream [`crate::OpusDecoder::decode`] calls.
+    /// error from the per-stream [`crate::OpusDecoder::decode`] calls. If an
+    /// error occurs after decoding begins, output may be partially modified and
+    /// some stream decoder states may have advanced; discard this decoder and
+    /// create a new one before retrying.
     pub fn decode(
         &mut self,
         packet: &[u8],
@@ -281,21 +322,77 @@ impl OpusMSDecoder {
         output: &mut [f32],
     ) -> Result<usize, Error> {
         let nch = self.layout.nb_channels;
-        let mut buf = vec![0f32; frame_size * 2];
         let mut data = packet;
-        let mut produced = frame_size;
+
+        // Parse every stream and compare packet durations before mutating any
+        // decoder state. `frame_size` is capacity, not the packet's duration.
+        let lost = packet.is_empty();
+        let mut decoded_samples = None;
+        if lost {
+            // Lost packet (libopus do_plc): conceal every stream, capped at
+            // 120 ms like opus_multistream_decode_native.
+            decoded_samples = Some(frame_size.min(self.sample_rate as usize / 25 * 3));
+        } else {
+            for s in 0..self.layout.nb_streams {
+                let last = s == self.layout.nb_streams - 1;
+                let frames = parse_frames(data, !last)?;
+                if frames.ranges().iter().any(|(_, len)| *len > 1275) {
+                    return Err(Error::InvalidPacket("frame exceeds 1275 bytes"));
+                }
+                let samples_per_frame =
+                    crate::repacketizer::samples_per_frame(frames.toc, self.sample_rate) as usize;
+                let stream_samples = frames
+                    .count
+                    .checked_mul(samples_per_frame)
+                    .ok_or(Error::BufferTooSmall("multistream duration overflow"))?;
+                if let Some(expected) = decoded_samples {
+                    if stream_samples != expected {
+                        return Err(Error::InvalidPacket("multistream duration mismatch"));
+                    }
+                } else {
+                    decoded_samples = Some(stream_samples);
+                }
+                if !last {
+                    data = &data[frames.end..];
+                }
+            }
+        }
+
+        let decoded_samples = decoded_samples.unwrap_or(0);
+        if decoded_samples > frame_size {
+            return Err(Error::BufferTooSmall("multistream frame buffer too small"));
+        }
+        let needed = decoded_samples
+            .checked_mul(nch)
+            .ok_or(Error::BufferTooSmall("multistream output size overflow"))?;
+        if output.len() < needed {
+            return Err(Error::BufferTooSmall("multistream output buffer too small"));
+        }
+        let scratch_len = decoded_samples
+            .checked_mul(2)
+            .ok_or(Error::BufferTooSmall("multistream scratch size overflow"))?;
+        let mut buf = vec![0f32; scratch_len];
+        output[..needed].fill(0.0);
+
+        let mut data = packet;
+        let mut produced = decoded_samples;
+        // A lost packet conceals exactly the capped duration on each stream.
+        let capacity = if lost { decoded_samples } else { frame_size };
 
         for s in 0..self.layout.nb_streams {
             let coupled = s < self.layout.nb_coupled_streams;
             let last = s == self.layout.nb_streams - 1;
             // Determine this stream's byte slice.
-            let (stream_slice, advance) = if last {
-                (data, data.len())
+            let (stream_packet, advance) = if last || lost {
+                (Cow::Borrowed(data), data.len())
             } else {
-                let off = parse_frames(data, true)?.end;
-                (&data[..off], off)
+                let (normalized, advance) = normalize_self_delimited_packet(data)?;
+                (Cow::Owned(normalized), advance)
             };
-            let n = self.decoders[s].decode(stream_slice, frame_size, &mut buf)?;
+            let n = self.decoders[s].decode(stream_packet.as_ref(), capacity, &mut buf)?;
+            if n != decoded_samples {
+                return Err(Error::InvalidPacket("multistream duration mismatch"));
+            }
             produced = n;
             // Remux this stream's channel(s) to the output.
             if coupled {
@@ -350,11 +447,114 @@ impl OpusMSDecoder {
     }
 }
 
+fn normalize_self_delimited_packet(data: &[u8]) -> Result<(Vec<u8>, usize), Error> {
+    let frames = parse_frames(data, true)?;
+    let ranges = frames.ranges();
+    if ranges.iter().any(|(_, len)| *len > 1275) {
+        return Err(Error::InvalidPacket("frame exceeds 1275 bytes"));
+    }
+
+    // Each stream's self-delimited prefix is replaced with a standard code-3
+    // VBR header before handing the packet to the single-stream decoder.
+    let mut normalized = Vec::new();
+    normalized.push((frames.toc & 0xfc) | 3);
+    normalized.push(0x80 | frames.count as u8);
+    for &(_, len) in ranges.iter().take(frames.count.saturating_sub(1)) {
+        if len < 252 {
+            normalized.push(len as u8);
+        } else {
+            let first = 252 + (len & 3);
+            normalized.push(first as u8);
+            normalized.push(((len - first) / 4) as u8);
+        }
+    }
+    for &(offset, len) in ranges {
+        normalized.extend_from_slice(&data[offset..offset + len]);
+    }
+    Ok((normalized, frames.end))
+}
+
 impl OpusMSEncoder {
     /// Cap the audio bandwidth of every stream at once.
     pub fn set_max_bandwidth(&mut self, bw: Bandwidth) {
         for e in &mut self.encoders {
             e.max_bandwidth = bw;
         }
+    }
+}
+
+#[cfg(test)]
+mod multistream_encoder_preflight_tests {
+    use super::OpusMSEncoder;
+    use crate::{Application, Error};
+
+    fn encoder(channels: usize, family: i32) -> OpusMSEncoder {
+        OpusMSEncoder::new(48000, channels, family, Application::RestrictedLowDelay).unwrap()
+    }
+
+    fn pcm(len: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| ((i * 17 % 97) as f32 + 1.0) / 100.0)
+            .collect()
+    }
+
+    fn assert_input_too_small(result: Result<Vec<u8>, Error>) {
+        assert!(matches!(
+            result,
+            Err(Error::BadArg("input buffer too small"))
+        ));
+    }
+
+    #[test]
+    fn family_zero_mono_and_stereo_reject_empty_and_short_input() {
+        for channels in [1, 2] {
+            for input_len in [0, 120 * channels - 1] {
+                let mut enc = encoder(channels, 0);
+                assert_input_too_small(enc.encode(&pcm(input_len), 120));
+            }
+        }
+    }
+
+    #[test]
+    fn family_one_quad_rejects_before_any_stream_analysis_or_encoding() {
+        let mut after_rejection = encoder(4, 1);
+        let mut fresh = encoder(4, 1);
+        assert_input_too_small(after_rejection.encode(&pcm(479), 120));
+        assert!(
+            after_rejection
+                .encoders
+                .iter()
+                .all(|encoder| !encoder.tonality.initialized())
+        );
+
+        let full = pcm(480);
+        let after_packet = after_rejection.encode(&full, 120).unwrap();
+        let fresh_packet = fresh.encode(&full, 120).unwrap();
+        assert_eq!(after_packet, fresh_packet);
+    }
+
+    #[test]
+    fn invalid_frame_sizes_precede_empty_input_validation() {
+        let mut enc = encoder(8, 1);
+        for frame_size in [0, 48, usize::MAX] {
+            assert!(matches!(
+                enc.encode(&[], frame_size),
+                Err(Error::BadArg("Invalid frame size for sampling rate"))
+            ));
+        }
+    }
+
+    #[test]
+    fn family_one_three_channel_encoding_ignores_trailing_samples() {
+        let prefix = pcm(360);
+        let mut with_trailing = prefix.clone();
+        with_trailing.extend(std::iter::repeat(0.91f32).take(11));
+
+        let mut exact_encoder = encoder(3, 1);
+        let mut trailing_encoder = encoder(3, 1);
+        let exact_packet = exact_encoder.encode(&prefix, 120).unwrap();
+        let trailing_packet = trailing_encoder.encode(&with_trailing, 120).unwrap();
+        assert!(!exact_packet.is_empty());
+        assert_eq!(exact_packet, trailing_packet);
     }
 }
