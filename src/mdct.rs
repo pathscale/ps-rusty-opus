@@ -1023,14 +1023,11 @@ fn mdct_tdac_neon(output: &mut [f32], window: &[f32], overlap: usize) {
     // With `n4 = overlap2 & !3` and `i + 4 <= n4`, the raw loads and stores
     // touch `output`/`window` at `[i, i + 4)` and `[overlap - 4 - i, overlap - i)`,
     // so they require `output.len() >= overlap` and `window.len() >= overlap`.
-    // These two bounds are still NOT enforced: neither this fn nor its
-    // caller, `MdctLookup::backward`, checks them. `backward` only asserts
-    // `output.len() >= overlap2 + n2`, which implies `>= overlap` only when
-    // `n2 >= overlap - overlap2`, and it never checks `window.len()`. Both
-    // hold for every mode the crate builds (`window` is `mode.window`, length
-    // `overlap`; `n2 >= 120 > 60`), but `backward` is a safe `pub fn`, and on
-    // aarch64 a short `window`/`output` passed to it would be accessed out of
-    // bounds here. (The x86 scalar and AVX paths index-check these accesses.)
+    // `MdctLookup::backward` asserts these lengths before dispatch; retain this
+    // local guard as defense in depth if another caller is added later.
+    if output.len() < overlap || window.len() < overlap {
+        return;
+    }
     unsafe {
         let out_ptr = output.as_mut_ptr();
         let win_ptr = window.as_ptr();

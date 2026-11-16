@@ -1065,6 +1065,12 @@ fn quant_partition_encode(
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
+/// Quantize one band partition.
+///
+/// # Panics
+///
+/// Panics if `x` or the supplied `lowband` is shorter than `n`; SIMD paths
+/// access those slices through raw pointers and require the complete window.
 pub fn quant_partition(
     ctx: &mut BandCtx,
     x: &mut [f32],
@@ -1076,6 +1082,11 @@ pub fn quant_partition(
     gain: f32,
     fill: u32,
 ) -> u32 {
+    assert!(x.len() >= n, "quant_partition output too short");
+    assert!(
+        lowband.as_ref().is_none_or(|lb| lb.len() >= n),
+        "quant_partition lowband too short"
+    );
     /* Check split condition FIRST, before dispatching to specialized handlers.
     This matches the C code which checks this at the top of quant_partition. */
     let should_split = if lm >= 0 && n > 2 {

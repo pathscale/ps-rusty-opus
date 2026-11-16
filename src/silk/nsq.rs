@@ -21,11 +21,158 @@ pub fn silk_nsq(
     lambda_q10: i32,
     ltp_scale_q14: i32,
 ) {
+    assert!(
+        ps_enc_c.nb_subfr > 0 && (ps_enc_c.nb_subfr as usize) <= MAX_NB_SUBFR,
+        "silk_nsq: nb_subfr must be in 1..=MAX_NB_SUBFR"
+    );
+    assert!(
+        ps_enc_c.subfr_length >= 0 && (ps_enc_c.subfr_length as usize) <= MAX_SUB_FRAME_LENGTH,
+        "silk_nsq: subfr_length must be in 0..=MAX_SUB_FRAME_LENGTH"
+    );
+    assert!(
+        ps_enc_c.shaping_lpc_order >= 2
+            && (ps_enc_c.shaping_lpc_order as usize) <= MAX_SHAPE_LPC_ORDER
+            && (ps_enc_c.shaping_lpc_order & 1) == 0,
+        "silk_nsq: shaping_lpc_order must be even and in 2..=MAX_SHAPE_LPC_ORDER"
+    );
+    assert!(
+        ps_enc_c.predict_lpc_order >= 0 && (ps_enc_c.predict_lpc_order as usize) <= MAX_LPC_ORDER,
+        "silk_nsq: predict_lpc_order must be in 0..=MAX_LPC_ORDER"
+    );
+
+    let lsf_interpolation_flag: i32 = i32::from(ps_indices.nlsf_interp_coef_q2 != 4);
+    let voiced = ps_indices.signal_type == TYPE_VOICED as i8;
+    let pred_order = ps_enc_c.predict_lpc_order as usize;
+    let shape_order = ps_enc_c.shaping_lpc_order as usize;
+    for k in 0..ps_enc_c.nb_subfr as usize {
+        let a_offset = ((k >> 1) | (1 - lsf_interpolation_flag as usize)) * MAX_LPC_ORDER;
+        assert!(
+            a_offset + pred_order <= pred_coef_q12.len(),
+            "silk_nsq: pred_coef_q12 window is too short"
+        );
+        let shape_offset = k * MAX_SHAPE_LPC_ORDER;
+        assert!(
+            shape_offset + shape_order <= ar_q13.len(),
+            "silk_nsq: ar_q13 window is too short"
+        );
+    }
+    let nb_subfr = ps_enc_c.nb_subfr as usize;
+    let subfr_length = ps_enc_c.subfr_length as usize;
+    let frame_samples = nb_subfr
+        .checked_mul(subfr_length)
+        .expect("silk_nsq: frame length overflow");
+    assert!(
+        ps_enc_c.frame_length >= 0
+            && ps_enc_c.frame_length as usize == frame_samples
+            && frame_samples <= MAX_FRAME_LENGTH,
+        "silk_nsq: frame_length must match the configured subframes"
+    );
+    assert!(
+        x16.len() >= frame_samples,
+        "silk_nsq: input sample slice is too short"
+    );
+    assert!(
+        pulses.len() >= frame_samples,
+        "silk_nsq: pulse slice is too short"
+    );
+    assert!(
+        pitch_l.len() >= nb_subfr,
+        "silk_nsq: pitch slice is too short"
+    );
+    assert!(
+        gains_q16.len() >= nb_subfr,
+        "silk_nsq: gain slice is too short"
+    );
+    assert!(
+        harm_shape_gain_q14.len() >= nb_subfr,
+        "silk_nsq: harmonic-shape gain slice is too short"
+    );
+    assert!(
+        tilt_q14.len() >= nb_subfr,
+        "silk_nsq: tilt slice is too short"
+    );
+    assert!(
+        lf_shp_q14.len() >= nb_subfr,
+        "silk_nsq: low-frequency shaping slice is too short"
+    );
+    assert!(
+        (ps_indices.signal_type >> 1) >= 0
+            && (ps_indices.signal_type >> 1) < 2
+            && (0..2).contains(&ps_indices.quant_offset_type),
+        "silk_nsq: quantizer offset index is out of range"
+    );
+    assert!(
+        ps_enc_c.ltp_mem_length >= 0
+            && (ps_enc_c.ltp_mem_length as usize) <= LTP_MEM_LENGTH_MS * MAX_FS_KHZ,
+        "silk_nsq: LTP memory length is out of range"
+    );
+    let ltp_mem_length = ps_enc_c.ltp_mem_length as usize;
+    assert!(
+        frame_samples == 0 || ltp_mem_length > 0,
+        "silk_nsq: nonempty frames require positive LTP memory"
+    );
+    let nsq_state_length = frame_samples
+        .checked_add(ltp_mem_length)
+        .expect("silk_nsq: NSQ state length overflow");
+    assert!(
+        nsq_state_length <= nsq.xq.len() && nsq_state_length <= nsq.s_ltp_shp_q14.len(),
+        "silk_nsq: frame and LTP memory exceed NSQ state capacity"
+    );
+    if voiced {
+        assert!(
+            ltp_coef_q14.len()
+                >= nb_subfr
+                    .checked_mul(LTP_ORDER)
+                    .expect("silk_nsq: LTP coefficient length overflow"),
+            "silk_nsq: LTP coefficient slice is too short"
+        );
+        assert!(
+            pred_order >= 6 && pred_order % 2 == 0,
+            "silk_nsq: voiced predict_lpc_order must be even and in 6..=MAX_LPC_ORDER"
+        );
+
+        // Validate all voiced history windows before mutating NSQ state or pulses.
+        let mut pred_idx = ltp_mem_length;
+        let mut shp_idx = ltp_mem_length;
+        for k in 0..nb_subfr {
+            let lag = pitch_l[k];
+            assert!(
+                lag > (LTP_ORDER / 2) as i32,
+                "silk_nsq: voiced pitch lag must exceed half the LTP order"
+            );
+            let lag = lag as usize;
+            let rewhite = (k & (3 - (lsf_interpolation_flag << 1) as usize)) == 0;
+            if rewhite {
+                let start_idx =
+                    ltp_mem_length as i64 - lag as i64 - pred_order as i64 - (LTP_ORDER as i64 / 2);
+                assert!(
+                    start_idx > 0,
+                    "silk_nsq: voiced pitch lag is out of range for rewhitening"
+                );
+                pred_idx = ltp_mem_length;
+            } else {
+                assert!(
+                    pred_idx >= lag + LTP_ORDER / 2,
+                    "silk_nsq: voiced pitch lag exceeds LTP predictor history"
+                );
+            }
+            assert!(
+                shp_idx >= lag + HARM_SHAPE_FIR_TAPS / 2,
+                "silk_nsq: voiced pitch lag exceeds shaping history"
+            );
+            pred_idx = pred_idx
+                .checked_add(subfr_length)
+                .expect("silk_nsq: LTP index overflow");
+            shp_idx = shp_idx
+                .checked_add(subfr_length)
+                .expect("silk_nsq: shaping index overflow");
+        }
+    }
+
     let _prof = crate::prof::scope(crate::prof::Stage::SilkNsq);
     let mut lag: usize;
     let mut start_idx: usize;
     let mut a_q12: &[i16];
-    let mut b_q14: &[i16];
     let mut ar_shp_q13: &[i16];
     let mut harm_shape_fir_packed_q14: i32;
     let mut offset_q10: i32;
@@ -38,21 +185,25 @@ pub fn silk_nsq(
 
     lag = nsq.lag_prev as usize;
 
-    let lsf_interpolation_flag: i32 = i32::from(ps_indices.nlsf_interp_coef_q2 != 4);
-
     nsq.s_ltp_shp_buf_idx = ps_enc_c.ltp_mem_length;
     nsq.s_ltp_buf_idx = ps_enc_c.ltp_mem_length;
 
     let pxq_idx = ps_enc_c.ltp_mem_length as usize;
 
     for k in 0..ps_enc_c.nb_subfr as usize {
-        a_q12 =
-            &pred_coef_q12[((k >> 1) | (1 - lsf_interpolation_flag as usize)) * MAX_LPC_ORDER..];
-        b_q14 = &ltp_coef_q14[k * LTP_ORDER..];
-        ar_shp_q13 = &ar_q13[k * MAX_SHAPE_LPC_ORDER..];
+        let a_offset = ((k >> 1) | (1 - lsf_interpolation_flag as usize)) * MAX_LPC_ORDER;
+        a_q12 = &pred_coef_q12[a_offset..a_offset + pred_order];
+        let b_q14 = if voiced {
+            let offset = k * LTP_ORDER;
+            &ltp_coef_q14[offset..offset + LTP_ORDER]
+        } else {
+            &[]
+        };
+        let shape_offset = k * MAX_SHAPE_LPC_ORDER;
+        ar_shp_q13 = &ar_q13[shape_offset..shape_offset + shape_order];
 
         nsq.rewhite_flag = 0;
-        if ps_indices.signal_type == TYPE_VOICED as i8 {
+        if voiced {
             lag = pitch_l[k] as usize;
 
             if (k & (3 - (lsf_interpolation_flag << 1) as usize)) == 0 {
@@ -60,7 +211,10 @@ pub fn silk_nsq(
                     - lag as i32
                     - ps_enc_c.predict_lpc_order
                     - (LTP_ORDER as i32 / 2);
-                debug_assert!(start_idx_signed > 0);
+                assert!(
+                    start_idx_signed > 0,
+                    "silk_nsq: rewhitening start must be positive"
+                );
                 start_idx = start_idx_signed as usize;
 
                 silk_lpc_analysis_filter(
@@ -215,15 +369,9 @@ fn silk_nsq_noise_shape_feedback_loop(
         return silk_nsq_noise_shape_feedback_loop_order12(data0_val, data1, coef);
     }
 
-    // SAFETY: every index touched is in `0..order`. `order` is the encoder's
-    // `shaping_lpc_order`, which `silk_control_encoder` (control_codec.rs) only
-    // ever sets to an even value in 12..=24 (12 is handled above), so the
-    // pairwise loop's `j - 1`/`j` stay <= order - 2 and `order - 1` <= 23.
-    // `data1` is `nsq.s_ar2_q14` (`[i32; MAX_SHAPE_LPC_ORDER]` = 24 elements)
-    // and `coef` is `&ar_q13[k * MAX_SHAPE_LPC_ORDER..]` with `ar_q13` sized
-    // `MAX_NB_SUBFR * MAX_SHAPE_LPC_ORDER` (structs.rs), so it has >= 24
-    // elements. NOTE: these are caller invariants; `silk_nsq` is a safe `pub`
-    // fn and does not re-check them.
+    // SAFETY: silk_nsq validates an even order in 2..=MAX_SHAPE_LPC_ORDER before
+    // calling this helper and passes a coefficient window of that order. Every
+    // touched index is therefore in 0..order and within the 24-element state.
     unsafe {
         let mut tmp2 = data0_val;
         let mut tmp1 = *data1.get_unchecked(0);
@@ -256,11 +404,9 @@ fn silk_nsq_noise_shape_feedback_loop_order12(
     data1: &mut [i32],
     coef: &[i16],
 ) -> i32 {
-    // SAFETY: indices 0..=11 only. `data1` is `nsq.s_ar2_q14`
-    // (`[i32; MAX_SHAPE_LPC_ORDER]` = 24 elements) and `coef` is
-    // `&ar_q13[k * MAX_SHAPE_LPC_ORDER..]` of a `MAX_NB_SUBFR *
-    // MAX_SHAPE_LPC_ORDER` array, so both have >= 24 elements (caller
-    // invariant from `silk_nsq`'s only in-crate call path).
+    // SAFETY: called only for order 12 after silk_nsq validates the shaping
+    // order and the full per-subframe coefficient window. Its fixed 0..=11
+    // accesses fit that window and the 24-element state.
     unsafe {
         let d0 = data0_val;
         let d1 = *data1.get_unchecked(0);
@@ -331,10 +477,10 @@ fn silk_noise_shape_quantizer(
 ) {
     let gain_q10 = gain_q16 >> 6;
 
-    let shp_lag_base = (nsq.s_ltp_shp_buf_idx as usize).wrapping_sub(lag) + HARM_SHAPE_FIR_TAPS / 2;
-    let pred_lag_base = (nsq.s_ltp_buf_idx as usize).wrapping_sub(lag) + LTP_ORDER / 2;
-
     if signal_type == TYPE_VOICED {
+        let shp_lag_base =
+            (nsq.s_ltp_shp_buf_idx as usize).wrapping_sub(lag) + HARM_SHAPE_FIR_TAPS / 2;
+        let pred_lag_base = (nsq.s_ltp_buf_idx as usize).wrapping_sub(lag) + LTP_ORDER / 2;
         silk_noise_shape_quantizer_voiced(
             nsq,
             x_sc_q10,
@@ -385,12 +531,8 @@ fn silk_noise_shape_quantizer(
 fn lpc_pred_order6(s_lpc: &[i32], a_q12: &[i16], idx: usize) -> i32 {
     let mut pred = 3i32;
 
-    // SAFETY: reads `s_lpc[idx - 5..=idx]` and `a_q12[0..6]`. The callers pass
-    // `s_lpc = nsq.s_lpc_q14` (`MAX_SUB_FRAME_LENGTH + NSQ_LPC_BUF_LENGTH`
-    // elements) and `idx = NSQ_LPC_BUF_LENGTH - 1 + i` with
-    // `i < subfr_length <= MAX_SUB_FRAME_LENGTH`, so `idx < s_lpc.len()` and
-    // `idx - 5 >= 10`. `a_q12` is `&pred_coef_q12[0 or MAX_LPC_ORDER..]` of a
-    // `2 * MAX_LPC_ORDER` array (enc_api.rs), so it has >= 16 elements.
+    // SAFETY: silk_nsq bounds subfr_length, so idx = 15 + i is within the
+    // fixed LPC state. Its entry validation and coefficient window provide 6 values.
     unsafe {
         pred = silk_smlawb(
             pred,
@@ -430,12 +572,8 @@ fn lpc_pred_order6(s_lpc: &[i32], a_q12: &[i16], idx: usize) -> i32 {
 fn lpc_pred_order10(s_lpc: &[i32], a_q12: &[i16], idx: usize) -> i32 {
     let mut pred = 5i32;
 
-    // SAFETY: reads `s_lpc[idx - 9..=idx]` and `a_q12[0..10]`. The callers pass
-    // `s_lpc = nsq.s_lpc_q14` (`MAX_SUB_FRAME_LENGTH + NSQ_LPC_BUF_LENGTH`
-    // elements) and `idx = NSQ_LPC_BUF_LENGTH - 1 + i` with
-    // `i < subfr_length <= MAX_SUB_FRAME_LENGTH`, so `idx < s_lpc.len()` and
-    // `idx - 9 >= 6`. `a_q12` is `&pred_coef_q12[0 or MAX_LPC_ORDER..]` of a
-    // `2 * MAX_LPC_ORDER` array (enc_api.rs), so it has >= 16 elements.
+    // SAFETY: silk_nsq bounds subfr_length, so idx = 15 + i is within the
+    // fixed LPC state. Its entry validation and coefficient window provide 10 values.
     unsafe {
         pred = silk_smlawb(
             pred,
@@ -495,12 +633,8 @@ fn lpc_pred_order10(s_lpc: &[i32], a_q12: &[i16], idx: usize) -> i32 {
 fn lpc_pred_order16(s_lpc: &[i32], a_q12: &[i16], idx: usize) -> i32 {
     let mut pred = 8i32;
 
-    // SAFETY: reads `s_lpc[idx - 15..=idx]` and `a_q12[0..16]`. The callers
-    // pass `s_lpc = nsq.s_lpc_q14` (`MAX_SUB_FRAME_LENGTH + NSQ_LPC_BUF_LENGTH`
-    // elements) and `idx = NSQ_LPC_BUF_LENGTH - 1 + i` (= 15 + i) with
-    // `i < subfr_length <= MAX_SUB_FRAME_LENGTH`, so `idx < s_lpc.len()` and
-    // `idx - 15 = i >= 0`. `a_q12` is `&pred_coef_q12[0 or MAX_LPC_ORDER..]` of
-    // a `2 * MAX_LPC_ORDER` array (enc_api.rs), so it has >= 16 elements.
+    // SAFETY: silk_nsq bounds subfr_length, so idx = 15 + i is within the
+    // fixed LPC state. Its entry validation and coefficient window provide 16 values.
     unsafe {
         pred = silk_smlawb(
             pred,
@@ -590,12 +724,8 @@ fn lpc_pred_order16(s_lpc: &[i32], a_q12: &[i16], idx: usize) -> i32 {
 fn lpc_pred_generic(s_lpc: &[i32], a_q12: &[i16], idx: usize, order: usize) -> i32 {
     let mut pred = (order as i32) >> 1;
     for j in 0..order {
-        // SAFETY: requires `order <= 16`: then `idx - j >= idx - 15 >= 0`
-        // (`idx = NSQ_LPC_BUF_LENGTH - 1 + i`), `idx < s_lpc.len()` (see
-        // `lpc_pred_order16`), and `j < 16 <= a_q12.len()`. This fallback is
-        // only reached for a `predict_lpc_order` outside {6, 10, 16};
-        // `silk_control_encoder` only ever sets 10 or 16, so in-crate it is
-        // unreachable. Nothing here re-checks `order <= 16`.
+        // SAFETY: silk_nsq validates order <= MAX_LPC_ORDER, bounds idx through
+        // the subframe length, and checks that the coefficient window covers order.
         pred = unsafe {
             silk_smlawb(
                 pred,
@@ -962,4 +1092,66 @@ fn silk_noise_shape_quantizer_unvoiced(
     nsq.s_ltp_buf_idx = s_ltp_buf_idx as i32;
     nsq.s_lf_ar_q14 = s_lf_ar_q14;
     nsq.s_diff_shp_q14 = s_diff_shp_q14;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::silk_nsq;
+    use crate::silk::define::{MAX_LPC_ORDER, MAX_SUB_FRAME_LENGTH};
+    use crate::silk::structs::{SideInfoIndices, SilkEncoderStateCommon, SilkNSQState};
+
+    fn valid_common() -> SilkEncoderStateCommon {
+        let mut common = SilkEncoderStateCommon::default();
+        common.nb_subfr = 1;
+        common.subfr_length = 1;
+        common.shaping_lpc_order = 12;
+        common.predict_lpc_order = 10;
+        common
+    }
+
+    fn call(common: &SilkEncoderStateCommon, pred: &[i16], shape: &[i16]) {
+        let mut indices = SideInfoIndices::default();
+        indices.nlsf_interp_coef_q2 = 0;
+        silk_nsq(
+            common,
+            &mut SilkNSQState::default(),
+            &indices,
+            &[],
+            &mut [],
+            pred,
+            &[],
+            shape,
+            &[],
+            &[],
+            &[],
+            &[],
+            &[],
+            0,
+            0,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "shaping_lpc_order")]
+    fn rejects_invalid_shaping_order_at_public_boundary() {
+        let mut common = valid_common();
+        common.shaping_lpc_order = 13;
+        call(&common, &[0; 16], &[0; 24]);
+    }
+
+    #[test]
+    #[should_panic(expected = "predict_lpc_order")]
+    fn rejects_oversized_predict_order_at_public_boundary() {
+        let mut common = valid_common();
+        common.predict_lpc_order = (MAX_LPC_ORDER + 1) as i32;
+        call(&common, &[0; 16], &[0; 24]);
+    }
+
+    #[test]
+    #[should_panic(expected = "subfr_length")]
+    fn rejects_oversized_subframe_at_public_boundary() {
+        let mut common = valid_common();
+        common.subfr_length = (MAX_SUB_FRAME_LENGTH + 1) as i32;
+        call(&common, &[0; 16], &[0; 24]);
+    }
 }
